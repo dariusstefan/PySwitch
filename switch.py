@@ -7,21 +7,30 @@ import time
 from wrapper import recv_from_any_link, send_to_link, get_switch_mac, get_interface_name
 from enum import Enum, auto
 
+
 class SwitchState(Enum):
     STATE_INIT = 0
     STATE_LISTENING = auto()
-    STATE_FORWARD = auto()
+    STATE_RECEIVED = auto()
+    STATE_UNICAST = auto()
+    STATE_BROADCAST = auto()
+
 
 class InstanceData:
     def __init__(self):
+        switch_priority = None
+        VLAN_table = None
         CAM_table = None
         num_interfaces = None
         current_dest_mac = None
         current_src_mac = None
         current_ethertype = None
+        vlan_id = None
         input_interface = None
+        output_interface = None
         packet_data = None
         packet_length = None
+
 
 def do_state_init(instance_data):
     # init returns the max interface number. Our interfaces
@@ -44,7 +53,13 @@ def do_state_init(instance_data):
 
     instance_data.CAM_table = {}
     instance_data.num_interfaces = num_interfaces
+
+    instance_data.switch_priority, instance_data.VLAN_table = config_vlan(switch_id)
+    print(f"Switch priority: {instance_data.switch_priority}")
+    print_vlan_table(instance_data.VLAN_table)
+    print("-------------------------")
     return SwitchState.STATE_LISTENING
+
 
 def do_state_listening(instance_data):
     # Note that data is of type bytes([...]).
@@ -57,6 +72,7 @@ def do_state_listening(instance_data):
 
     instance_data.current_dest_mac = dest_mac
     instance_data.current_src_mac = src_mac
+    instance_data.vlan_id = vlan_id
 
     # Print the MAC src and MAC dst in human readable format
     print("Source MAC: ", end='')
@@ -68,6 +84,7 @@ def do_state_listening(instance_data):
     # tagged_frame = data[0:12] + create_vlan_tag(10) + data[12:]
 
     print(f'EtherType: {ethertype}')
+    print(f'VLAN ID: {vlan_id}')
 
     print("Received frame of size {} on interface {}".format(length, interface), flush=True)
 
@@ -80,35 +97,61 @@ def do_state_listening(instance_data):
     instance_data.packet_data = data
     instance_data.packet_length = length
 
-    # TODO: Implement forwarding with learning
-    # TODO: Implement VLAN support
     # TODO: Implement STP support
 
-    # data is of type bytes.
-    # send_to_link(i, data, length)
-    return SwitchState.STATE_FORWARD
+    return SwitchState.STATE_RECEIVED
 
-def do_state_forward(instance_data):
+
+def do_state_received(instance_data):
     instance_data.CAM_table[instance_data.current_src_mac] = instance_data.input_interface
     if is_unicast(instance_data.current_dest_mac):
         if instance_data.current_dest_mac in instance_data.CAM_table:
-            send_to_link(instance_data.CAM_table[instance_data.current_dest_mac], instance_data.packet_data, instance_data.packet_length)
+            instance_data.output_interface = instance_data.CAM_table[instance_data.current_dest_mac]
+            return SwitchState.STATE_UNICAST
         else:
-            for i in range(0, instance_data.num_interfaces):
-                if i != instance_data.input_interface:
-                    send_to_link(i, instance_data.packet_data, instance_data.packet_length)
+            return SwitchState.STATE_BROADCAST
     else:
-        for i in range(0, instance_data.num_interfaces):
-            if i != instance_data.input_interface:
-                send_to_link(i, instance_data.packet_data, instance_data.packet_length)
+        return SwitchState.STATE_BROADCAST
+    
 
+def do_state_unicast(instance_data):
+    forward_packet(instance_data, instance_data.input_interface, instance_data.output_interface)
     return SwitchState.STATE_LISTENING
+
+
+def do_state_broadcast(instance_data):
+    for interface in range(instance_data.num_interfaces):
+        if interface != instance_data.input_interface:
+            forward_packet(instance_data, instance_data.input_interface, interface)
+    return SwitchState.STATE_LISTENING
+
+
+def forward_packet(instance_data, input_iface, output_iface):
+    if instance_data.VLAN_table[input_iface] == 'T':
+        if instance_data.VLAN_table[output_iface] == 'T':
+            send_to_link(output_iface, instance_data.packet_data, instance_data.packet_length)
+        else:
+            if instance_data.VLAN_table[output_iface] == instance_data.vlan_id:
+                new_packet = instance_data.packet_data[0:12] + instance_data.packet_data[16:]
+                send_to_link(output_iface, new_packet, instance_data.packet_length - 4)
+    else:
+        input_vlan = instance_data.VLAN_table[input_iface]
+        if instance_data.VLAN_table[output_iface] == 'T':
+            new_packet = instance_data.packet_data[0:12] + create_vlan_tag(input_vlan) + instance_data.packet_data[12:]
+            send_to_link(output_iface, new_packet, instance_data.packet_length + 4)
+        else:
+            if instance_data.VLAN_table[output_iface] == input_vlan:
+                send_to_link(output_iface, instance_data.packet_data, instance_data.packet_length)
+
 
 state_functions = {
     SwitchState.STATE_INIT: do_state_init,
     SwitchState.STATE_LISTENING: do_state_listening,
-    SwitchState.STATE_FORWARD: do_state_forward
+    SwitchState.STATE_RECEIVED: do_state_received,
+    SwitchState.STATE_UNICAST: do_state_unicast,
+    SwitchState.STATE_BROADCAST: do_state_broadcast,
 }
+
 
 def run_state(state, instance_data):
     return state_functions[state](instance_data)
@@ -132,28 +175,54 @@ def parse_ethernet_header(data):
 
     return dest_mac, src_mac, ether_type, vlan_id
 
+
 def create_vlan_tag(vlan_id):
     # 0x8100 for the Ethertype for 802.1Q
     # vlan_id & 0x0FFF ensures that only the last 12 bits are used
     return struct.pack('!H', 0x8200) + struct.pack('!H', vlan_id & 0x0FFF)
+
 
 def send_bdpu_every_sec():
     while True:
         # TODO Send BDPU every second if necessary
         time.sleep(1)
 
+
 def is_unicast(mac):
     first_byte = mac[0]
     return (first_byte & 0x01) == 0
 
+
 def print_mac(mac):
     print(':'.join(f'{b:02x}' for b in mac))
+
 
 def print_cam_table(cam_table):
     for key, value in cam_table.items():
         print(f"MAC: {':'.join(f'{b:02x}' for b in key)}, Interface: {value}")
 
+
+def config_vlan(switch_id):
+    VLAN_table = {}
+    path = f"./configs/switch{switch_id}.cfg"
+    with open(path, "r") as file:
+        switch_priority = int(file.readline().strip())
+        interface_number = 0
+        for line in file:
+            _, vlan = line.strip().split()
+            VLAN_table[interface_number] = vlan if vlan == 'T' else int(vlan)
+            interface_number += 1
+        return switch_priority, VLAN_table
+    
+    
+def print_vlan_table(vlan_table):
+    print("VLAN table:")
+    for interface, vlan in vlan_table.items():
+        print(f"Interface: {interface}, VLAN: {vlan}")
+
+
 instance_data = InstanceData()
+
 
 def main():
     current_state = SwitchState.STATE_INIT
