@@ -16,11 +16,20 @@ class SwitchState(Enum):
     STATE_BROADCAST = auto()
 
 
+class STPPortState(Enum):
+    BLOCKED_PORT = 0
+    DESIGNATED_PORT = auto()
+    ROOT_PORT = auto()
+
+
 class InstanceData:
     def __init__(self):
         switch_priority = None
         VLAN_table = None
         CAM_table = None
+        STP_table = None
+        root_bridge_id = None
+        root_path_cost = None
         num_interfaces = None
         current_dest_mac = None
         current_src_mac = None
@@ -43,10 +52,6 @@ def do_state_init(instance_data):
     print("# Starting switch with id {}".format(switch_id), flush=True)
     print("[INFO] Switch MAC", ':'.join(f'{b:02x}' for b in get_switch_mac()))
 
-    # Create and start a new thread that deals with sending BDPU
-    t = threading.Thread(target=send_bdpu_every_sec)
-    t.start()
-
     # Printing interface names
     for i in interfaces:
         print(get_interface_name(i))
@@ -58,6 +63,19 @@ def do_state_init(instance_data):
     print(f"Switch priority: {instance_data.switch_priority}")
     print_vlan_table(instance_data.VLAN_table)
     print("-------------------------")
+
+    instance_data.STP_table = {}
+    instance_data.root_bridge_id = instance_data.switch_priority
+    instance_data.root_path_cost = b'\x00'
+
+    for interface in interfaces:
+        if instance_data.VLAN_table[interface] == 'T':
+            instance_data.STP_table[interface] = STPPortState.DESIGNATED_PORT
+
+    # Create and start a new thread that deals with sending BDPU
+    t = threading.Thread(target=send_bdpu_every_sec, args=[instance_data.switch_priority, instance_data.VLAN_table])
+    t.start()
+
     return SwitchState.STATE_LISTENING
 
 
@@ -74,36 +92,61 @@ def do_state_listening(instance_data):
     instance_data.current_src_mac = src_mac
     instance_data.vlan_id = vlan_id
 
-    # Print the MAC src and MAC dst in human readable format
-    print("Source MAC: ", end='')
-    print_mac(src_mac)
-    print("Destination MAC: ", end='')
-    print_mac(dest_mac)
-
-    # Note. Adding a VLAN tag can be as easy as
-    # tagged_frame = data[0:12] + create_vlan_tag(10) + data[12:]
-
-    print(f'EtherType: {ethertype}')
-    print(f'VLAN ID: {vlan_id}')
-
-    print("Received frame of size {} on interface {}".format(length, interface), flush=True)
-
-    print("CAM table:")
-    print_cam_table(instance_data.CAM_table)
-    print("-------------------------")
-
     instance_data.current_ethertype = ethertype
     instance_data.input_interface = interface
     instance_data.packet_data = data
     instance_data.packet_length = length
 
-    # TODO: Implement STP support
-
     return SwitchState.STATE_RECEIVED
 
 
+def add_to_path_cost(path_cost, value):
+    old_value = int.from_bytes(path_cost, byteorder='big')
+    new_value = old_value + value
+    return new_value.to_bytes(1, byteorder='big')
+
+
+def update_STP_table(instance_data, root_bridge_id, sender_bridge_id, sender_path_cost):
+    own_bridge_id = instance_data.switch_priority
+    if root_bridge_id < instance_data.root_bridge_id:
+        old_root_bridge_id = instance_data.root_bridge_id
+
+        instance_data.root_bridge_id = root_bridge_id
+        instance_data.root_path_cost = add_to_path_cost(sender_path_cost, 10)
+        instance_data.STP_table[instance_data.input_interface] = STPPortState.ROOT_PORT
+
+        if old_root_bridge_id == own_bridge_id:
+            for port in instance_data.STP_table:
+                if instance_data.STP_table[port] != STPPortState.ROOT_PORT:
+                    instance_data.STP_table[port] = STPPortState.BLOCKED_PORT
+        
+        new_bdpu = make_bdpu(root_bridge_id, own_bridge_id, instance_data.root_path_cost)
+        for port in instance_data.VLAN_table:
+            if instance_data.VLAN_table[port] == 'T':
+                send_to_link(port, new_bdpu, len(new_bdpu))
+    elif root_bridge_id == instance_data.root_bridge_id:
+        if instance_data.STP_table[instance_data.input_interface] == STPPortState.ROOT_PORT:
+            if add_to_path_cost(sender_path_cost, 10) < instance_data.root_path_cost:
+                instance_data.root_path_cost = add_to_path_cost(sender_path_cost, 10)
+        else:
+            if sender_path_cost > instance_data.root_path_cost:
+                instance_data.STP_table[instance_data.input_interface] = STPPortState.DESIGNATED_PORT
+    elif sender_bridge_id == own_bridge_id:
+        instance_data.STP_table[instance_data.input_interface] = STPPortState.BLOCKED_PORT
+    
+    if own_bridge_id == root_bridge_id:
+        for port in instance_data.STP_table:
+            instance_data.STP_table[port] = STPPortState.DESIGNATED_PORT
+
+
 def do_state_received(instance_data):
+    if is_bdpu(instance_data.current_dest_mac):
+        root_bridge_id, sender_bridge_id, sender_path_cost = parse_bdpu(instance_data.packet_data)
+        update_STP_table(instance_data, root_bridge_id, sender_bridge_id, sender_path_cost)
+        return SwitchState.STATE_LISTENING
+    
     instance_data.CAM_table[instance_data.current_src_mac] = instance_data.input_interface
+
     if is_unicast(instance_data.current_dest_mac):
         if instance_data.current_dest_mac in instance_data.CAM_table:
             instance_data.output_interface = instance_data.CAM_table[instance_data.current_dest_mac]
@@ -128,7 +171,7 @@ def do_state_broadcast(instance_data):
 
 def forward_packet(instance_data, input_iface, output_iface):
     if instance_data.VLAN_table[input_iface] == 'T':
-        if instance_data.VLAN_table[output_iface] == 'T':
+        if instance_data.VLAN_table[output_iface] == 'T' and instance_data.STP_table[output_iface] != STPPortState.BLOCKED_PORT:
             send_to_link(output_iface, instance_data.packet_data, instance_data.packet_length)
         else:
             if instance_data.VLAN_table[output_iface] == instance_data.vlan_id:
@@ -136,7 +179,7 @@ def forward_packet(instance_data, input_iface, output_iface):
                 send_to_link(output_iface, new_packet, instance_data.packet_length - 4)
     else:
         input_vlan = instance_data.VLAN_table[input_iface]
-        if instance_data.VLAN_table[output_iface] == 'T':
+        if instance_data.VLAN_table[output_iface] == 'T' and instance_data.STP_table[output_iface] != STPPortState.BLOCKED_PORT:
             new_packet = instance_data.packet_data[0:12] + create_vlan_tag(input_vlan) + instance_data.packet_data[12:]
             send_to_link(output_iface, new_packet, instance_data.packet_length + 4)
         else:
@@ -182,15 +225,23 @@ def create_vlan_tag(vlan_id):
     return struct.pack('!H', 0x8200) + struct.pack('!H', vlan_id & 0x0FFF)
 
 
-def send_bdpu_every_sec():
+def send_bdpu_every_sec(bridge_id, VLAN_table):
     while True:
-        # TODO Send BDPU every second if necessary
+        sender_path_cost = b'\x00'
+        bdpu = make_bdpu(bridge_id, bridge_id, sender_path_cost)
+        for port in VLAN_table:
+            if VLAN_table[port] == 'T':
+                send_to_link(port, bdpu, len(bdpu))
         time.sleep(1)
 
 
 def is_unicast(mac):
     first_byte = mac[0]
     return (first_byte & 0x01) == 0
+
+
+def is_bdpu(mac):
+    return mac == b'\x01\x80\xc2\x00\x00\x00'
 
 
 def print_mac(mac):
@@ -207,6 +258,7 @@ def config_vlan(switch_id):
     path = f"./configs/switch{switch_id}.cfg"
     with open(path, "r") as file:
         switch_priority = int(file.readline().strip())
+        switch_priority = switch_priority.to_bytes(2, byteorder='big')
         interface_number = 0
         for line in file:
             _, vlan = line.strip().split()
@@ -220,6 +272,28 @@ def print_vlan_table(vlan_table):
     for interface, vlan in vlan_table.items():
         print(f"Interface: {interface}, VLAN: {vlan}")
 
+
+def print_stp_table(stp_table):
+    print("STP table:")
+    for interface, state in stp_table.items():
+        print(f"Interface: {interface}, State: {state}")
+
+
+def make_bdpu(root_bridge_id, sender_bridge_id, sender_path_cost):
+    dst_mac = b'\x01\x80\xc2\x00\x00\x00'
+    src_mac = get_switch_mac()
+    llc_header = b'\x42\x42\x03'
+    bdpu_header = b'\x00\x00\x00\x00'
+    llc_length = 12
+    llc_length = llc_length.to_bytes(2, byteorder='big')
+
+    return dst_mac + src_mac + llc_length + llc_header + bdpu_header + root_bridge_id + sender_bridge_id + sender_path_cost
+
+def parse_bdpu(data):
+    root_bridge_id = data[21:23]
+    sender_bridge_id = data[23:25]
+    sender_path_cost = data[25].to_bytes(1, byteorder='big')
+    return root_bridge_id, sender_bridge_id, sender_path_cost
 
 instance_data = InstanceData()
 
