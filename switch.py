@@ -41,7 +41,11 @@ class InstanceData:
         packet_length = None
 
 
-def do_state_init(instance_data):
+global instance_data
+instance_data = InstanceData()
+
+
+def do_state_init():
     # init returns the max interface number. Our interfaces
     # are 0, 1, 2, ..., init_ret value + 1
     switch_id = sys.argv[1]
@@ -73,13 +77,13 @@ def do_state_init(instance_data):
             instance_data.STP_table[interface] = STPPortState.DESIGNATED_PORT
 
     # Create and start a new thread that deals with sending BDPU
-    t = threading.Thread(target=send_bdpu_every_sec, args=[instance_data.switch_priority, instance_data.VLAN_table])
+    t = threading.Thread(target=send_bdpu_every_sec, args=[])
     t.start()
 
     return SwitchState.STATE_LISTENING
 
 
-def do_state_listening(instance_data):
+def do_state_listening():
     # Note that data is of type bytes([...]).
     # b1 = bytes([72, 101, 108, 108, 111])  # "Hello"
     # b2 = bytes([32, 87, 111, 114, 108, 100])  # " World"
@@ -106,7 +110,7 @@ def add_to_path_cost(path_cost, value):
     return new_value.to_bytes(1, byteorder='big')
 
 
-def update_STP_table(instance_data, root_bridge_id, sender_bridge_id, sender_path_cost):
+def update_STP_table(root_bridge_id, sender_bridge_id, sender_path_cost):
     own_bridge_id = instance_data.switch_priority
     if root_bridge_id < instance_data.root_bridge_id:
         old_root_bridge_id = instance_data.root_bridge_id
@@ -139,10 +143,10 @@ def update_STP_table(instance_data, root_bridge_id, sender_bridge_id, sender_pat
             instance_data.STP_table[port] = STPPortState.DESIGNATED_PORT
 
 
-def do_state_received(instance_data):
+def do_state_received():
     if is_bdpu(instance_data.current_dest_mac):
         root_bridge_id, sender_bridge_id, sender_path_cost = parse_bdpu(instance_data.packet_data)
-        update_STP_table(instance_data, root_bridge_id, sender_bridge_id, sender_path_cost)
+        update_STP_table(root_bridge_id, sender_bridge_id, sender_path_cost)
         return SwitchState.STATE_LISTENING
     
     instance_data.CAM_table[instance_data.current_src_mac] = instance_data.input_interface
@@ -157,20 +161,20 @@ def do_state_received(instance_data):
         return SwitchState.STATE_BROADCAST
     
 
-def do_state_unicast(instance_data):
-    forward_packet(instance_data, instance_data.input_interface, instance_data.output_interface)
+def do_state_unicast():
+    forward_packet(instance_data.input_interface, instance_data.output_interface)
     return SwitchState.STATE_LISTENING
 
 
-def do_state_broadcast(instance_data):
+def do_state_broadcast():
     for interface in range(instance_data.num_interfaces):
         if interface != instance_data.input_interface:
-            forward_packet(instance_data, instance_data.input_interface, interface)
+            forward_packet(instance_data.input_interface, interface)
     return SwitchState.STATE_LISTENING
 
 
-def forward_packet(instance_data, input_iface, output_iface):
-    if instance_data.VLAN_table[input_iface] == 'T':
+def forward_packet(input_iface, output_iface):
+    if instance_data.VLAN_table[input_iface] == 'T' and instance_data.STP_table[input_iface] != STPPortState.BLOCKED_PORT:
         if instance_data.VLAN_table[output_iface] == 'T' and instance_data.STP_table[output_iface] != STPPortState.BLOCKED_PORT:
             send_to_link(output_iface, instance_data.packet_data, instance_data.packet_length)
         else:
@@ -196,8 +200,8 @@ state_functions = {
 }
 
 
-def run_state(state, instance_data):
-    return state_functions[state](instance_data)
+def run_state(state):
+    return state_functions[state]()
 
 
 def parse_ethernet_header(data):
@@ -225,13 +229,15 @@ def create_vlan_tag(vlan_id):
     return struct.pack('!H', 0x8200) + struct.pack('!H', vlan_id & 0x0FFF)
 
 
-def send_bdpu_every_sec(bridge_id, VLAN_table):
+def send_bdpu_every_sec():
+    bridge_id = instance_data.switch_priority
     while True:
-        sender_path_cost = b'\x00'
-        bdpu = make_bdpu(bridge_id, bridge_id, sender_path_cost)
-        for port in VLAN_table:
-            if VLAN_table[port] == 'T':
-                send_to_link(port, bdpu, len(bdpu))
+        if instance_data.root_bridge_id == bridge_id:
+            sender_path_cost = b'\x00'
+            bdpu = make_bdpu(bridge_id, bridge_id, sender_path_cost)
+            for port in instance_data.VLAN_table:
+                if instance_data.VLAN_table[port] == 'T':
+                    send_to_link(port, bdpu, len(bdpu))
         time.sleep(1)
 
 
@@ -289,20 +295,19 @@ def make_bdpu(root_bridge_id, sender_bridge_id, sender_path_cost):
 
     return dst_mac + src_mac + llc_length + llc_header + bdpu_header + root_bridge_id + sender_bridge_id + sender_path_cost
 
+
 def parse_bdpu(data):
     root_bridge_id = data[21:23]
     sender_bridge_id = data[23:25]
     sender_path_cost = data[25].to_bytes(1, byteorder='big')
     return root_bridge_id, sender_bridge_id, sender_path_cost
 
-instance_data = InstanceData()
-
 
 def main():
     current_state = SwitchState.STATE_INIT
 
     while True:
-        current_state = run_state(current_state, instance_data)
+        current_state = run_state(current_state)
 
 
 if __name__ == "__main__":
